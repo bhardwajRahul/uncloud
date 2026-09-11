@@ -29,6 +29,7 @@ const (
 	lockCleanupTimeout = 5 * time.Minute
 )
 
+//nolint:gochecknoinits // Caddy modules must register during package initialisation.
 func init() {
 	caddy.RegisterModule(new(Storage))
 }
