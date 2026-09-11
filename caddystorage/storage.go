@@ -79,6 +79,5 @@ func storageError(operation, key string, err error) error {
 	if status.Code(err) == codes.NotFound {
 		err = fs.ErrNotExist
 	}
-	// TODO: figure out what the appropriate way of calling the storage in caddy logs is, e.g. include uncloud or redundant if logger includes the name?
-	return fmt.Errorf("%s Caddy storage key '%s': %w", operation, key, err)
+	return fmt.Errorf("uncloud storage: %s key %q: %w", operation, key, err)
 }
