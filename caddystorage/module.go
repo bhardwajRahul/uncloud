@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log/slog"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/caddyserver/caddy/v2"
@@ -24,6 +25,8 @@ const (
 	DefaultSocketPath = "/run/uncloud/uncloud.sock"
 	// DefaultLockTTL is the default duration of a distributed lock lease.
 	DefaultLockTTL = 20 * time.Second
+	// lockCleanupTimeout bounds how long an unloaded module waits for active lock operations when cleaning up.
+	lockCleanupTimeout = 5 * time.Minute
 )
 
 func init() {
@@ -46,8 +49,15 @@ type Storage struct {
 	locker *distlock.Locker
 	log    *slog.Logger
 
+	// ctx is the module context from Provision. Caddy cancels it when it unloads the module and calls Cleanup.
+	ctx context.Context
+
+	// locksMu protects locks.
 	locksMu sync.Mutex
-	locks   map[string]*distlock.Lease
+	// locks maps successfully acquired lock names to held leases.
+	locks map[string]*distlock.Lease
+	// lockOps counts Lock calls until they fail or their locks are released.
+	lockOps atomic.Int64
 }
 
 // CaddyModule returns the Caddy module information.
@@ -60,6 +70,7 @@ func (*Storage) CaddyModule() caddy.ModuleInfo {
 
 // Provision connects the storage to the local Uncloud API and initialises the distributed locker.
 func (s *Storage) Provision(ctx caddy.Context) error {
+	s.ctx = ctx
 	s.log = ctx.Slogger()
 
 	if s.Socket == "" {
@@ -93,50 +104,44 @@ func (s *Storage) Provision(ctx caddy.Context) error {
 	return nil
 }
 
-// Cleanup releases active locks and closes the Uncloud API connection.
-func (s *Storage) Cleanup() (err error) {
-	s.locksMu.Lock()
-	locks := s.locks
-	s.locks = nil
-	s.locksMu.Unlock()
+// Cleanup keeps the Uncloud API connection open so acquired lock leases can renew until Caddy releases them. It closes
+// the connection after all lock operations finish or the cleanup timeout expires.
+func (s *Storage) Cleanup() error {
+	if s.client == nil {
+		// Provision failed before opening the storage.
+		return nil
+	}
 
 	started := time.Now()
-	s.log.Debug("cleaning up module", "locks", len(locks))
-	defer func() {
-		if err != nil {
-			s.log.Debug("failed to clean up module", "duration", time.Since(started), "error", err)
-		} else {
-			s.log.Debug("module cleanup complete", "duration", time.Since(started))
+	s.log.Debug("cleaning up module", "locks", s.lockOps.Load())
+
+	go func() {
+		timer := time.NewTimer(lockCleanupTimeout)
+		defer timer.Stop()
+		ticker := time.NewTicker(1 * time.Second)
+		defer ticker.Stop()
+
+		timedOut := false
+		for !timedOut && s.lockOps.Load() > 0 {
+			select {
+			case <-ticker.C:
+			case <-timer.C:
+				timedOut = true
+			}
 		}
+		if remaining := s.lockOps.Load(); timedOut && remaining > 0 {
+			s.log.Debug("timed out waiting for active locks to be unlocked",
+				"locks", remaining, "timeout", lockCleanupTimeout)
+		}
+
+		if err := s.client.Close(); err != nil {
+			s.log.Debug("failed to clean up module", "duration", time.Since(started), "error", err)
+			return
+		}
+		s.log.Debug("module cleanup complete", "duration", time.Since(started))
 	}()
 
-	ctx, cancel := context.WithTimeout(context.Background(), distlock.DefaultMaxNodeCallTimeout)
-	defer cancel()
-
-	errCh := make(chan error, len(locks))
-	var wg sync.WaitGroup
-	for name, lease := range locks {
-		wg.Go(func() {
-			if err := s.releaseLock(ctx, name, lease, "cleanup"); err != nil {
-				errCh <- fmt.Errorf("release lock '%s': %w", name, err)
-			}
-		})
-	}
-	wg.Wait()
-	close(errCh)
-
-	errs := make([]error, 0, len(errCh)+1)
-	for err := range errCh {
-		errs = append(errs, err)
-	}
-
-	if s.client != nil {
-		errs = append(errs, s.client.Close())
-		s.client = nil
-		s.locker = nil
-	}
-
-	return errors.Join(errs...)
+	return nil
 }
 
 // CertMagicStorage returns the provisioned CertMagic storage implementation.
